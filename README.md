@@ -3,7 +3,7 @@
 An asynchronous FastAPI endpoint that turns a workplace message into an ordered action plan,
 selects resources from `catalog.json`, and optionally schedules a check-in.
 
-## Setup
+## Setup and model configuration
 
 Python 3.11 or 3.12:
 
@@ -14,7 +14,18 @@ python -m pip install -r requirements.txt
 cp .env.example .env
 ```
 
-Set `GEMINI_API_KEY` in `.env`, then run:
+Configure `.env`:
+
+```dotenv
+GEMINI_API_KEY=your-gemini-api-key
+GEMINI_MODEL=gemini-3.8-flash
+GOAL_TIMEZONE=Europe/London
+MODEL_TIMEOUT_SECONDS=35
+CALENDAR_TIMEOUT_SECONDS=15
+CALENDAR_REQUEST_TIMEOUT_SECONDS=6
+```
+
+Then run:
 
 ```bash
 .venv/bin/uvicorn main:app --port 8000 --reload
@@ -26,7 +37,7 @@ The default model is `gemini-3.8-flash`, configurable through `GEMINI_MODEL`.
 The model must support Interactions and structured output. Without a key, generation returns
 503 with `model_not_configured`. Keep `.env` out of Git.
 
-## API
+## Example request and response
 
 ```bash
 curl -s http://localhost:8000/generate_goal_track \
@@ -91,13 +102,15 @@ Invalid input returns 422. Model failures return `{"error":{"code":"...","messag
 504 for exceeding the model time budget. Calendar failure preserves the plan as HTTP 200
 with `status: partial`.
 
-## Design
+## Approach and tradeoffs
 
-- The full 30-resource catalog is provided to Gemini in one structured generation. A retrieval
-  service is unnecessary for this dataset.
+- The full 30-resource catalog is provided to Gemini in one structured generation. This avoids
+  the setup and retrieval errors of a separate search service, at the cost of sending the
+  catalog with each request. A larger catalog would justify evaluating retrieval and reranking.
 - Resource IDs are constrained by JSON Schema and validated locally. Titles, types, and
   descriptions come from the catalog. Actions and explanations still need semantic review.
-- Invalid output gets one repair attempt. Calendar calls occur only after plan validation.
+- Invalid output gets one repair attempt. This balances recovery against latency and model
+  cost. Calendar calls occur only after plan validation.
 - The official `google-genai` SDK uses asynchronous Interactions with `store=False`.
   Clients are shared for the application lifespan and closed on shutdown.
 - Model requests have a 35-second total budget including repair and retries. The pinned SDK
@@ -110,12 +123,24 @@ with `status: partial`.
   validates that evidence and the datetime. Intent extraction remains model-driven;
   matching evidence alone does not prove the user's meaning.
 
+The endpoint coordinates generation, validation, and optional scheduling in a fixed workflow.
+Model-generated text cannot directly execute a tool. A calendar failure preserves the useful
+plan rather than failing the entire response.
+
+### Significant assumptions
+
 Defaults are configurable in `.env.example`. `GOAL_TIMEZONE` defaults to `Europe/London`;
 an explicit user timezone overrides it. Dates are resolved against the request's current time.
 `next Friday` means the strictly next Friday after the local reference date. Morning, afternoon,
 and evening mean 09:00, 14:00, and 18:00, with assumptions reported in the response.
 Missing times, invalid or past dates, unclear timezones, and daylight-saving gaps or repeated
 hours require clarification. UTC conversion uses Python's `zoneinfo`.
+
+The model interprets relative dates; local validation checks that its proposed time is valid
+and in the future, but does not independently verify the interpretation of every date phrase.
+The catalog descriptions are the source of truth; the application does not fetch the actual
+videos, readings, or exercises. Unsupported requests return `out_of_scope` rather than forcing
+an unrelated resource recommendation.
 
 ## Validation
 
@@ -124,6 +149,7 @@ hours require clarification. UTC conversion uses Python's `zoneinfo`.
 .venv/bin/python -m pytest -q
 .venv/bin/ruff check .
 .venv/bin/ruff format --check .
+.venv/bin/python -m pip check
 ```
 
 Observed offline results: **65 tests passed**; lint, formatting, and dependency checks passed.
@@ -131,6 +157,28 @@ Tests cover input validation, catalog grounding, repair, partial results, calend
 and retries, SDK serialization/error handling, concurrency, and timezone/DST conversion.
 They use a fixed clock and mocked network responses, requiring no key or internet.
 Starlette's test client emits one HTTPX deprecation warning; the tests still pass.
+
+Representative reproducible checks and observed outcomes:
+
+| Check | Observed outcome |
+| --- | --- |
+| Deadline message without a check-in | Ordered plan with canonical resource metadata; no calendar call |
+| Unclear check-in time | Plan preserved as `partial`; clarification returned; no event created |
+| Calendar 503 followed by success | One retry; event ID copied from the successful simulated response |
+| Calendar timeout or success without an event ID | `unknown`, never `scheduled`; no automatic retry |
+| Invented resource ID | One repair attempt; persistent invalid output returns 502 |
+| London 09:00 on 16 October 2026 | Converted to 08:00 UTC; DST gaps and repeated times require clarification |
+
+Run these focused groups independently:
+
+```bash
+.venv/bin/python -m pytest -q tests/test_api.py
+.venv/bin/python -m pytest -q tests/test_gemini.py
+.venv/bin/python -m pytest -q tests/test_calendar.py tests/test_timing.py
+```
+
+These outcomes were observed with mocked dependencies. They verify software behaviour and
+SDK request contracts, not the usefulness or accuracy of live Gemini recommendations.
 
 Run live Gemini evaluation with calendar calls disabled:
 
@@ -144,20 +192,34 @@ Review action quality and explanation faithfulness manually; automated checks ar
 Use `--live-calendar` only to intentionally create test events in the supplied mock service.
 Live Gemini quality and calendar POST behavior remain unverified in the recorded initial build.
 
-## Scope and submission notes
+## Time spent, unfinished work, and next improvements
 
-The initial build took approximately 30 minutes including setup, tests, and documentation.
-Include subsequent cleanup, evaluation, and changes in the final time estimate.
+The initial implementation took approximately 30 minutes, including setup, automated checks,
+and initial documentation. Subsequent review, cleanup, and documentation revisions were
+additional and were not timed separately.
+
+Unfinished verification: live Gemini access, recommendation quality, and actual calendar POST
+behaviour have not been recorded as verified. The live evaluation script is ready for those
+checks. The example response above is illustrative, and the observed test outcomes use mocks.
+
 Direct dependencies are pinned; transitive dependencies are not fully locked.
 There is no UI, database, authentication, deployment, recurring scheduling, or request
 deduplication. Clarification is stateless: later requests must include the relevant context.
 Repeating a successful scheduling request can create another event.
 
-Next improvements should follow live evaluation findings: improve intent/date extraction,
-refine resource explanations, and add idempotency if supported by the calendar service.
+Next, I would review the live evaluation responses, improve intent and date extraction where
+they fail, and refine resource explanations. I would add idempotency if supported by the
+calendar service, and fully lock dependencies for reproducible installation.
 
-Codex was used to inspect the brief and repository, check Gemini docs, implement the backend,
-write and run tests, and prepare documentation.
+## Use of AI coding tools
+
+I provided the overall framework and defined the tasks to be executed, and I designed the
+solution. Codex helped translate that design into the implementation by writing the raw code.
+It also assisted with checking the Gemini documentation, writing and running tests, cleanup,
+and preparing the README. The use of Codex is disclosed separately from the observed validation
+results and the live checks that remain unfinished.
+
+## References
 
 References: [assessment](https://github.com/ignitus-app/ai-engineer-assessment),
 [Interactions](https://ai.google.dev/gemini-api/docs/interactions-overview),
